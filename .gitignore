@@ -30,4 +30,4 @@ migrations/versions/*.pyc
 
 # IDE
 .vscode/
-.idea/
+.idea/gcp-credentials.json

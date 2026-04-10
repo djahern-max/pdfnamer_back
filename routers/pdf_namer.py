@@ -17,6 +17,8 @@ import re
 import json
 
 import pdfplumber
+import pdf2image
+from google.cloud import vision
 from fastapi import APIRouter, File, HTTPException, UploadFile, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -30,7 +32,6 @@ from models.tenant import PdfNaming, Tenant
 
 router = APIRouter(prefix="/api/pdf-namer", tags=["PDF Namer"])
 
-# ✅ Fix 1: AsyncAnthropic instead of Anthropic
 _claude = anthropic.AsyncAnthropic()
 
 
@@ -60,14 +61,53 @@ class ConfirmResponse(BaseModel):
 
 
 def _extract_text(file_bytes: bytes) -> str:
-    """Synchronous PDF text extraction — always call via run_in_executor."""
+    # ── Step 1: pdfplumber (text-based PDFs) ─────────────────────────────────
     parts = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
             t = page.extract_text()
             if t:
                 parts.append(t)
-    return "\n".join(parts)[:6000]
+    text = "\n".join(parts)[:6000]
+
+    if text.strip():
+        return text
+
+    # ── Step 2: Google Cloud Vision OCR (send PDF directly) ──────────────────
+    client = vision.ImageAnnotatorClient()
+
+    input_config = vision.InputConfig(
+        content=file_bytes,
+        mime_type="application/pdf",
+    )
+    output_config = vision.OutputConfig(
+        gcs_destination=vision.GcsDestination(uri=""),
+        batch_size=1,
+    )
+    feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
+
+    request = vision.AsyncAnnotateFileRequest(
+        features=[feature],
+        input_config=input_config,
+    )
+
+    # Use synchronous batch for simplicity
+    response = client.batch_annotate_files(
+        requests=[
+            vision.AnnotateFileRequest(
+                input_config=input_config,
+                features=[feature],
+            )
+        ]
+    )
+
+    ocr_parts = []
+    for file_response in response.responses:
+        for page_response in file_response.responses:
+            if page_response.full_text_annotation.text:
+                ocr_parts.append(page_response.full_text_annotation.text)
+
+    return "\n".join(ocr_parts)[:6000]
 
 
 def _build_prompt(pdf_text: str, examples: list[dict]) -> str:
@@ -141,7 +181,6 @@ async def analyze_pdf(
         raise HTTPException(400, "File too large (20 MB max).")
 
     try:
-        # ✅ Fix 2: offload blocking pdfplumber call to a thread
         pdf_text = await asyncio.get_event_loop().run_in_executor(
             None, _extract_text, file_bytes
         )
@@ -149,13 +188,14 @@ async def analyze_pdf(
         raise HTTPException(422, f"Could not read PDF: {e}")
 
     if not pdf_text.strip():
-        raise HTTPException(422, "PDF has no extractable text (scanned image).")
+        raise HTTPException(
+            422, "Could not extract text from PDF (pdfplumber + OCR both failed)."
+        )
 
     examples = await _get_examples(db, tenant.id)
 
     prompt = _build_prompt(pdf_text, examples)
     try:
-        # ✅ Fix 1: await works correctly now that _claude is AsyncAnthropic
         response = await _claude.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=512,
@@ -253,26 +293,27 @@ async def list_patterns(
     return [
         {
             "id": r.id,
-            "original": r.original_filename,
-            "confirmed": r.confirmed_name,
+            "original_filename": r.original_filename,
+            "confirmed_name": r.confirmed_name,
             "vendor": r.vendor,
             "doc_date": r.doc_date,
             "amount": r.amount,
+            "doc_type": r.doc_type,
             "created_at": r.created_at.isoformat(),
         }
         for r in rows
     ]
 
 
-@router.delete("/patterns/{record_id}")
+@router.delete("/patterns/{pattern_id}")
 async def delete_pattern(
-    record_id: int,
+    pattern_id: int,
     tenant: Tenant = Depends(require_tenant),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
         select(PdfNaming).where(
-            PdfNaming.id == record_id,
+            PdfNaming.id == pattern_id,
             PdfNaming.tenant_id == tenant.id,
         )
     )
@@ -281,4 +322,4 @@ async def delete_pattern(
         raise HTTPException(404, "Pattern not found.")
     await db.delete(record)
     await db.commit()
-    return {"message": f"Deleted pattern {record_id}."}
+    return {"message": f"Pattern {pattern_id} deleted."}
