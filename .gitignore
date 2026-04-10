@@ -30,6 +30,8 @@ migrations/versions/*.pyc
 
 # IDE
 .vscode/
-.idea/gcp-credentials.json
+.idea/
+gcp-credentials.json
 
 notes.txt
+pdfreader_cloud_vision.json
