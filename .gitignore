@@ -31,3 +31,5 @@ migrations/versions/*.pyc
 # IDE
 .vscode/
 .idea/gcp-credentials.json
+
+notes.txt

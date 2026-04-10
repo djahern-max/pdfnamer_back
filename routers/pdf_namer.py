@@ -17,8 +17,6 @@ import re
 import json
 
 import pdfplumber
-import pdf2image
-from google.cloud import vision
 from fastapi import APIRouter, File, HTTPException, UploadFile, Depends
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -61,53 +59,14 @@ class ConfirmResponse(BaseModel):
 
 
 def _extract_text(file_bytes: bytes) -> str:
-    # ── Step 1: pdfplumber (text-based PDFs) ─────────────────────────────────
+    """Synchronous PDF text extraction — always call via run_in_executor."""
     parts = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
             t = page.extract_text()
             if t:
                 parts.append(t)
-    text = "\n".join(parts)[:6000]
-
-    if text.strip():
-        return text
-
-    # ── Step 2: Google Cloud Vision OCR (send PDF directly) ──────────────────
-    client = vision.ImageAnnotatorClient()
-
-    input_config = vision.InputConfig(
-        content=file_bytes,
-        mime_type="application/pdf",
-    )
-    output_config = vision.OutputConfig(
-        gcs_destination=vision.GcsDestination(uri=""),
-        batch_size=1,
-    )
-    feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
-
-    request = vision.AsyncAnnotateFileRequest(
-        features=[feature],
-        input_config=input_config,
-    )
-
-    # Use synchronous batch for simplicity
-    response = client.batch_annotate_files(
-        requests=[
-            vision.AnnotateFileRequest(
-                input_config=input_config,
-                features=[feature],
-            )
-        ]
-    )
-
-    ocr_parts = []
-    for file_response in response.responses:
-        for page_response in file_response.responses:
-            if page_response.full_text_annotation.text:
-                ocr_parts.append(page_response.full_text_annotation.text)
-
-    return "\n".join(ocr_parts)[:6000]
+    return "\n".join(parts)[:6000]
 
 
 def _build_prompt(pdf_text: str, examples: list[dict]) -> str:
@@ -127,10 +86,32 @@ Given the text of a financial/business document, extract key fields and suggest 
 
 Rules:
 - Return ONLY a JSON object, no markdown fences, no prose.
-- Keys: vendor, doc_date (MMDDYYYY), amount (digits+dot only, no $), doc_type, suggested_name, confidence ("high"|"medium"|"low")
+- Keys: vendor, doc_date (MMDDYYYY), amount (digits+dot only, no $), doc_type, payment_method, suggested_name, confidence ("high"|"medium"|"low")
 - For suggested_name: follow the pattern from examples above. If none exist, use: MMDDYYYY_Vendor_Amount
 - Underscores only (no spaces). Strip $ from amounts.
-- Use DUE DATE for doc_date if present, else statement date.
+
+Date rules:
+- Use DUE DATE for doc_date if present.
+- If no due date exists (e.g. receipt paid on the spot), use the transaction/invoice date.
+
+Amount rules:
+- If "Amount Due" is $0.00 but a payment was made, use the paid/charged amount instead.
+- Always capture the actual money that changed hands.
+
+doc_type rules — use exactly one of these values:
+  invoice       → has a due date, payment expected later
+  statement     → periodic account summary
+  cc_receipt    → paid at point of sale by credit or debit card
+  check_receipt → paid at point of sale by check or cash
+  contract      → rental agreement or service contract
+  estimate      → quote or proposal
+  other         → anything that doesn't fit above
+
+payment_method rules:
+- For cc_receipt: format as "Visa_XXXX", "Mastercard_XXXX", "Amex_XXXX" etc. using last 4 digits.
+  If card type is unknown, use "Card_XXXX".
+- For check_receipt: use "Check" or "Cash".
+- For all other doc types: set to null.
 
 Document text:
 \"\"\"
@@ -158,6 +139,7 @@ async def _get_examples(db: AsyncSession, tenant_id: int) -> list[dict]:
                 "doc_date": r.doc_date,
                 "amount": r.amount,
                 "doc_type": r.doc_type,
+                "payment_method": r.payment_method,
             },
         }
         for r in rows
@@ -188,13 +170,11 @@ async def analyze_pdf(
         raise HTTPException(422, f"Could not read PDF: {e}")
 
     if not pdf_text.strip():
-        raise HTTPException(
-            422, "Could not extract text from PDF (pdfplumber + OCR both failed)."
-        )
+        raise HTTPException(422, "PDF has no extractable text (scanned image).")
 
     examples = await _get_examples(db, tenant.id)
-
     prompt = _build_prompt(pdf_text, examples)
+
     try:
         response = await _claude.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -217,6 +197,7 @@ async def analyze_pdf(
         doc_date=fields.get("doc_date"),
         amount=fields.get("amount"),
         doc_type=fields.get("doc_type"),
+        payment_method=fields.get("payment_method"),
         confidence=fields.get("confidence", "medium"),
         pattern_used=(
             f"Based on {len(examples)} confirmed example(s)"
@@ -235,6 +216,7 @@ async def analyze_pdf(
             "date": fields.get("doc_date"),
             "amount": fields.get("amount"),
             "doc_type": fields.get("doc_type"),
+            "payment_method": fields.get("payment_method"),
         },
         confidence=fields.get("confidence", "medium"),
         pattern_used=record.pattern_used,
@@ -268,6 +250,8 @@ async def confirm_naming(
         template = template.replace(record.vendor, "{Vendor}")
     if record.amount:
         template = template.replace(record.amount, "{Amount}")
+    if record.payment_method:
+        template = template.replace(record.payment_method, "{PaymentMethod}")
 
     return ConfirmResponse(
         message=f'Saved "{record.confirmed_name}.pdf" and updated your naming pattern.',
@@ -293,27 +277,28 @@ async def list_patterns(
     return [
         {
             "id": r.id,
-            "original_filename": r.original_filename,
-            "confirmed_name": r.confirmed_name,
+            "original": r.original_filename,
+            "confirmed": r.confirmed_name,
             "vendor": r.vendor,
             "doc_date": r.doc_date,
             "amount": r.amount,
             "doc_type": r.doc_type,
+            "payment_method": r.payment_method,
             "created_at": r.created_at.isoformat(),
         }
         for r in rows
     ]
 
 
-@router.delete("/patterns/{pattern_id}")
+@router.delete("/patterns/{record_id}")
 async def delete_pattern(
-    pattern_id: int,
+    record_id: int,
     tenant: Tenant = Depends(require_tenant),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
         select(PdfNaming).where(
-            PdfNaming.id == pattern_id,
+            PdfNaming.id == record_id,
             PdfNaming.tenant_id == tenant.id,
         )
     )
@@ -322,4 +307,4 @@ async def delete_pattern(
         raise HTTPException(404, "Pattern not found.")
     await db.delete(record)
     await db.commit()
-    return {"message": f"Pattern {pattern_id} deleted."}
+    return {"message": f"Deleted pattern {record_id}."}

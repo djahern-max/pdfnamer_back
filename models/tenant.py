@@ -1,20 +1,8 @@
-"""
-models/tenant.py  –  PDF Auto-Namer (standalone, multi-tenant)
-
-Tables
-------
-tenants        – one row per customer org
-api_keys       – hashed API keys belonging to a tenant
-pdf_namings    – per-tenant naming history (pattern learning store)
-"""
-
+from datetime import datetime
 import hashlib
 import secrets
-from datetime import datetime
 
-from sqlalchemy import (
-    Boolean, DateTime, ForeignKey, Integer, String, func, Index
-)
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Boolean, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -22,59 +10,63 @@ class Base(DeclarativeBase):
     pass
 
 
-# ─── Tenant ──────────────────────────────────────────────────────────────────
+# ─── Tenant ───────────────────────────────────────────────────────────────────
+
 
 class Tenant(Base):
-    """One row = one customer (company / individual)."""
-
     __tablename__ = "tenants"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     slug: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-    api_keys: Mapped[list["ApiKey"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
-    pdf_namings: Mapped[list["PdfNaming"]] = relationship(back_populates="tenant", cascade="all, delete-orphan")
+    api_keys: Mapped[list["ApiKey"]] = relationship(
+        back_populates="tenant", cascade="all, delete-orphan"
+    )
+    pdf_namings: Mapped[list["PdfNaming"]] = relationship(
+        back_populates="tenant", cascade="all, delete-orphan"
+    )
 
 
-# ─── API Key ─────────────────────────────────────────────────────────────────
+# ─── ApiKey ───────────────────────────────────────────────────────────────────
+
 
 class ApiKey(Base):
-    """
-    Hashed API keys.  The raw key is only shown once at creation time.
-    We store SHA-256(key) so a DB leak doesn't expose usable secrets.
-    """
-
     __tablename__ = "api_keys"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     tenant_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
-    label: Mapped[str] = mapped_column(String(128), nullable=False, default="default")
-    key_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)   # SHA-256 hex
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    label: Mapped[str] = mapped_column(
+        String(128), nullable=False, server_default="default"
+    )
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     tenant: Mapped["Tenant"] = relationship(back_populates="api_keys")
-
-    # ── helpers ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def generate() -> tuple[str, str]:
         """
-        Returns (raw_key, key_hash).
         raw_key  → show to the user ONCE, never store it.
         key_hash → store in DB.
         """
-        raw = "pdfn_" + secrets.token_urlsafe(32)   # e.g. pdfn_abc123…
+        raw = "pdfn_" + secrets.token_urlsafe(32)
         hashed = hashlib.sha256(raw.encode()).hexdigest()
         return raw, hashed
 
@@ -83,7 +75,18 @@ class ApiKey(Base):
         return hashlib.sha256(raw_key.encode()).hexdigest()
 
 
-# ─── PDF Naming (updated with tenant FK) ─────────────────────────────────────
+# ─── PDF Naming ───────────────────────────────────────────────────────────────
+
+# Valid doc_type values — enforced in the prompt, stored as plain strings for flexibility.
+#
+#   invoice      Traditional A/P invoice with a due date
+#   statement    Periodic account statement
+#   cc_receipt   Paid at point of sale via credit/debit card
+#   check_receipt  Paid at POS via check or cash
+#   contract     Agreement / rental contract
+#   estimate     Quote or proposal
+#   other        Anything that doesn't fit the above
+
 
 class PdfNaming(Base):
     """
@@ -106,6 +109,10 @@ class PdfNaming(Base):
     doc_date: Mapped[str | None] = mapped_column(String(32), nullable=True)
     amount: Mapped[str | None] = mapped_column(String(32), nullable=True)
     doc_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    # e.g. "Visa_1762", "Mastercard_4433", "Check", "Cash" — for reconciliation
+    payment_method: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     confidence: Mapped[str | None] = mapped_column(String(16), nullable=True)
     pattern_used: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
@@ -117,5 +124,5 @@ class PdfNaming(Base):
 
 
 # ─── Indexes ──────────────────────────────────────────────────────────────────
-Index("ix_api_keys_key_hash",   ApiKey.key_hash)
-Index("ix_pdf_namings_tenant",  PdfNaming.tenant_id, PdfNaming.created_at)
+Index("ix_api_keys_key_hash", ApiKey.key_hash)
+Index("ix_pdf_namings_tenant", PdfNaming.tenant_id, PdfNaming.created_at)
