@@ -4,6 +4,10 @@ routers/pdf_namer.py  –  PDF Auto-Namer (multi-tenant)
 All routes require X-API-Key header → resolves to a Tenant.
 Pattern learning is fully isolated per tenant.
 
+Text extraction strategy:
+  1. pdfplumber  — fast, works on text-based PDFs
+  2. Google Cloud Vision OCR — fallback for scanned/image-based PDFs
+
 Routes:
   POST   /api/pdf-namer/analyze            Upload PDF → suggested filename
   POST   /api/pdf-namer/confirm            Confirm naming → saves pattern
@@ -13,6 +17,7 @@ Routes:
 
 import asyncio
 import io
+import os
 import re
 import json
 
@@ -23,6 +28,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 
 import anthropic
+from google.cloud import vision
+from google.oauth2 import service_account
+from pdf2image import convert_from_bytes
 
 from database import get_db
 from auth import require_tenant
@@ -31,6 +39,25 @@ from models.tenant import PdfNaming, Tenant
 router = APIRouter(prefix="/api/pdf-namer", tags=["PDF Namer"])
 
 _claude = anthropic.AsyncAnthropic()
+
+# ─── Google Cloud Vision client ───────────────────────────────────────────────
+
+_GCP_CREDENTIALS_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "pdfreader_cloud_vision.json",
+)
+
+_vision_client: vision.ImageAnnotatorClient | None = None
+
+
+def _get_vision_client() -> vision.ImageAnnotatorClient:
+    global _vision_client
+    if _vision_client is None:
+        credentials = service_account.Credentials.from_service_account_file(
+            _GCP_CREDENTIALS_FILE
+        )
+        _vision_client = vision.ImageAnnotatorClient(credentials=credentials)
+    return _vision_client
 
 
 # ─── Schemas ──────────────────────────────────────────────────────────────────
@@ -42,6 +69,7 @@ class AnalyzeResponse(BaseModel):
     confidence: str
     pattern_used: str | None
     session_id: str
+    ocr_used: bool = False
 
 
 class ConfirmRequest(BaseModel):
@@ -58,14 +86,38 @@ class ConfirmResponse(BaseModel):
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _extract_text(file_bytes: bytes) -> str:
-    """Synchronous PDF text extraction — always call via run_in_executor."""
+def _extract_text_pdfplumber(file_bytes: bytes) -> str:
+    """Fast text extraction for text-based PDFs."""
     parts = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
             t = page.extract_text()
             if t:
                 parts.append(t)
+    return "\n".join(parts)[:6000]
+
+
+def _extract_text_vision(file_bytes: bytes) -> str:
+    """OCR fallback for scanned/image-based PDFs via Google Cloud Vision."""
+    client = _get_vision_client()
+
+    images = convert_from_bytes(file_bytes, dpi=300)
+    parts = []
+
+    for image in images:
+        img_byte_arr = io.BytesIO()
+        image.save(img_byte_arr, format="PNG")
+        img_content = img_byte_arr.getvalue()
+
+        vision_image = vision.Image(content=img_content)
+        response = client.document_text_detection(image=vision_image)
+
+        if response.error.message:
+            raise RuntimeError(f"Vision API error: {response.error.message}")
+
+        if response.full_text_annotation.text:
+            parts.append(response.full_text_annotation.text)
+
     return "\n".join(parts)[:6000]
 
 
@@ -99,13 +151,13 @@ Amount rules:
 - Always capture the actual money that changed hands.
 
 doc_type rules — use exactly one of these values:
-  invoice       → has a due date, payment expected later
-  statement     → periodic account summary
-  cc_receipt    → paid at point of sale by credit or debit card
-  check_receipt → paid at point of sale by check or cash
-  contract      → rental agreement or service contract
-  estimate      → quote or proposal
-  other         → anything that doesn't fit above
+  invoice       -> has a due date, payment expected later
+  statement     -> periodic account summary
+  cc_receipt    -> paid at point of sale by credit or debit card
+  check_receipt -> paid at point of sale by check or cash
+  contract      -> rental agreement or service contract
+  estimate      -> quote or proposal
+  other         -> anything that doesn't fit above
 
 payment_method rules:
 - For cc_receipt: format as "Visa_XXXX", "Mastercard_XXXX", "Amex_XXXX" etc. using last 4 digits.
@@ -114,9 +166,7 @@ payment_method rules:
 - For all other doc types: set to null.
 
 Document text:
-\"\"\"
-{pdf_text}
-\"\"\"
+\"\"\"{pdf_text}\"\"\"
 """
 
 
@@ -162,15 +212,30 @@ async def analyze_pdf(
     if len(file_bytes) > 20 * 1024 * 1024:
         raise HTTPException(400, "File too large (20 MB max).")
 
+    # ── Step 1: try pdfplumber ─────────────────────────────────────────────
     try:
         pdf_text = await asyncio.get_event_loop().run_in_executor(
-            None, _extract_text, file_bytes
+            None, _extract_text_pdfplumber, file_bytes
         )
     except Exception as e:
         raise HTTPException(422, f"Could not read PDF: {e}")
 
+    # ── Step 2: fall back to Cloud Vision OCR if no text found ────────────
+    ocr_used = False
     if not pdf_text.strip():
-        raise HTTPException(422, "PDF has no extractable text (scanned image).")
+        try:
+            pdf_text = await asyncio.get_event_loop().run_in_executor(
+                None, _extract_text_vision, file_bytes
+            )
+            ocr_used = True
+        except Exception as e:
+            raise HTTPException(422, f"OCR failed on scanned PDF: {e}")
+
+    if not pdf_text.strip():
+        raise HTTPException(
+            422,
+            "Could not extract text from PDF (pdfplumber and OCR both returned empty).",
+        )
 
     examples = await _get_examples(db, tenant.id)
     prompt = _build_prompt(pdf_text, examples)
@@ -221,6 +286,7 @@ async def analyze_pdf(
         confidence=fields.get("confidence", "medium"),
         pattern_used=record.pattern_used,
         session_id=str(record.id),
+        ocr_used=ocr_used,
     )
 
 
