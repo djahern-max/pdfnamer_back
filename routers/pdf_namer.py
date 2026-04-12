@@ -1,3 +1,5 @@
+# PDF Auto-Namer (multi-tenant)
+
 """
 routers/pdf_namer.py  –  PDF Auto-Namer (multi-tenant)
 -------------------------------------------------------
@@ -7,6 +9,7 @@ Pattern learning is fully isolated per tenant.
 Text extraction strategy:
   1. pdfplumber  — fast, works on text-based PDFs
   2. Google Cloud Vision OCR — fallback for scanned/image-based PDFs
+     (sends raw PDF bytes directly — no poppler/pdf2image needed)
 
 Routes:
   POST   /api/pdf-namer/analyze            Upload PDF → suggested filename
@@ -16,6 +19,7 @@ Routes:
 """
 
 import asyncio
+import base64
 import io
 import os
 import re
@@ -30,7 +34,6 @@ from sqlalchemy import select, desc
 import anthropic
 from google.cloud import vision
 from google.oauth2 import service_account
-from pdf2image import convert_from_bytes
 
 from database import get_db
 from auth import require_tenant
@@ -98,25 +101,32 @@ def _extract_text_pdfplumber(file_bytes: bytes) -> str:
 
 
 def _extract_text_vision(file_bytes: bytes) -> str:
-    """OCR fallback for scanned/image-based PDFs via Google Cloud Vision."""
+    """OCR fallback — sends raw PDF bytes directly to Cloud Vision.
+    No poppler or pdf2image required."""
     client = _get_vision_client()
 
-    images = convert_from_bytes(file_bytes, dpi=300)
+    input_config = vision.InputConfig(
+        content=file_bytes,
+        mime_type="application/pdf",
+    )
+    output_config = vision.OutputConfig(
+        batch_size=2,  # pages per response
+    )
+    feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
+
+    request = vision.AnnotateFileRequest(
+        input_config=input_config,
+        features=[feature],
+    )
+
+    # Use the synchronous batch method for in-memory PDFs
+    response = client.batch_annotate_files(requests=[request])
+
     parts = []
-
-    for image in images:
-        img_byte_arr = io.BytesIO()
-        image.save(img_byte_arr, format="PNG")
-        img_content = img_byte_arr.getvalue()
-
-        vision_image = vision.Image(content=img_content)
-        response = client.document_text_detection(image=vision_image)
-
-        if response.error.message:
-            raise RuntimeError(f"Vision API error: {response.error.message}")
-
-        if response.full_text_annotation.text:
-            parts.append(response.full_text_annotation.text)
+    for file_response in response.responses:
+        for page_response in file_response.responses:
+            if page_response.full_text_annotation.text:
+                parts.append(page_response.full_text_annotation.text)
 
     return "\n".join(parts)[:6000]
 
@@ -135,21 +145,24 @@ def _build_prompt(pdf_text: str, examples: list[dict]) -> str:
 
     return f"""You are a document-naming assistant.
 Given the text of a financial/business document, extract key fields and suggest a filename.{examples_block}
-
+ 
 Rules:
 - Return ONLY a JSON object, no markdown fences, no prose.
-- Keys: vendor, doc_date (MMDDYYYY), amount (digits+dot only, no $), doc_type, payment_method, suggested_name, confidence ("high"|"medium"|"low")
-- For suggested_name: follow the pattern from examples above. If none exist, use: MMDDYYYY_Vendor_Amount
+- Keys: vendor, doc_date (MMDDYYYY), amount (digits+dot only, no $), doc_type, payment_method, invoice_number, suggested_name, confidence ("high"|"medium"|"low")
+- For suggested_name: follow the pattern from examples above. If none exist, use: MMDDYYYY_Vendor_Amount_InvNUMBER (omit invoice number if not present)
+    - cc_receipt:    MMDDYYYY_Vendor_Amount_CC_Visa_1762  (replace card type and last 4 with actual values)
+    - check_receipt: MMDDYYYY_Vendor_Amount_Check
+    - all others:    MMDDYYYY_Vendor_Amount
 - Underscores only (no spaces). Strip $ from amounts.
-
+ 
 Date rules:
 - Use DUE DATE for doc_date if present.
 - If no due date exists (e.g. receipt paid on the spot), use the transaction/invoice date.
-
+ 
 Amount rules:
 - If "Amount Due" is $0.00 but a payment was made, use the paid/charged amount instead.
 - Always capture the actual money that changed hands.
-
+ 
 doc_type rules — use exactly one of these values:
   invoice       -> has a due date, payment expected later
   statement     -> periodic account summary
@@ -158,13 +171,18 @@ doc_type rules — use exactly one of these values:
   contract      -> rental agreement or service contract
   estimate      -> quote or proposal
   other         -> anything that doesn't fit above
-
+ 
 payment_method rules:
 - For cc_receipt: format as "Visa_XXXX", "Mastercard_XXXX", "Amex_XXXX" etc. using last 4 digits.
   If card type is unknown, use "Card_XXXX".
 - For check_receipt: use "Check" or "Cash".
 - For all other doc types: set to null.
-
+ 
+invoice_number rules:
+- Extract the invoice, receipt, statement, or reference number if present.
+- Strip any leading labels (e.g. "Invoice #", "Ref:", "Statement No.", "Receipt #").
+- If no number is found, set to null.
+ 
 Document text:
 \"\"\"{pdf_text}\"\"\"
 """
@@ -190,6 +208,7 @@ async def _get_examples(db: AsyncSession, tenant_id: int) -> list[dict]:
                 "amount": r.amount,
                 "doc_type": r.doc_type,
                 "payment_method": r.payment_method,
+                "invoice_number": r.invoice_number,
             },
         }
         for r in rows
@@ -263,6 +282,7 @@ async def analyze_pdf(
         amount=fields.get("amount"),
         doc_type=fields.get("doc_type"),
         payment_method=fields.get("payment_method"),
+        invoice_number=fields.get("invoice_number"),
         confidence=fields.get("confidence", "medium"),
         pattern_used=(
             f"Based on {len(examples)} confirmed example(s)"
@@ -282,6 +302,7 @@ async def analyze_pdf(
             "amount": fields.get("amount"),
             "doc_type": fields.get("doc_type"),
             "payment_method": fields.get("payment_method"),
+            "invoice_number": fields.get("invoice_number"),
         },
         confidence=fields.get("confidence", "medium"),
         pattern_used=record.pattern_used,
@@ -317,7 +338,11 @@ async def confirm_naming(
     if record.amount:
         template = template.replace(record.amount, "{Amount}")
     if record.payment_method:
+        # payment_method is e.g. "Visa_1762" — tokenize both together and separately
+        template = template.replace(f"CC_{record.payment_method}", "CC_{PaymentMethod}")
         template = template.replace(record.payment_method, "{PaymentMethod}")
+    if record.invoice_number:
+        template = template.replace(record.invoice_number, "{InvoiceNumber}")
 
     return ConfirmResponse(
         message=f'Saved "{record.confirmed_name}.pdf" and updated your naming pattern.',
@@ -350,6 +375,7 @@ async def list_patterns(
             "amount": r.amount,
             "doc_type": r.doc_type,
             "payment_method": r.payment_method,
+            "invoice_number": r.invoice_number,
             "created_at": r.created_at.isoformat(),
         }
         for r in rows

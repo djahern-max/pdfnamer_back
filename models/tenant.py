@@ -80,7 +80,7 @@ class ApiKey(Base):
 # Valid doc_type values — enforced in the prompt, stored as plain strings for flexibility.
 #
 #   invoice      Traditional A/P invoice with a due date
-#   statement    Periodic account statement
+#   statement    Periodic account summary
 #   cc_receipt   Paid at point of sale via credit/debit card
 #   check_receipt  Paid at POS via check or cash
 #   contract     Agreement / rental contract
@@ -112,6 +112,9 @@ class PdfNaming(Base):
 
     # e.g. "Visa_1762", "Mastercard_4433", "Check", "Cash" — for reconciliation
     payment_method: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # e.g. "INV-1042", "2026-0391" — extracted from invoice/statement headers
+    invoice_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     confidence: Mapped[str | None] = mapped_column(String(16), nullable=True)
     pattern_used: Mapped[str | None] = mapped_column(String(512), nullable=True)
