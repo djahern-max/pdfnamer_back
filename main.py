@@ -10,6 +10,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from routers.pdf_namer import router as pdf_namer_router
 from routers.admin import router as admin_router
+from routers.qb_checker import router as qb_checker_router
+from routers.organizer import router as organizer_router
+from routers.bills_report import router as bills_report_router
 
 app = FastAPI(
     title="PDF Auto-Namer",
@@ -27,10 +30,15 @@ app.add_middleware(
 
 app.include_router(pdf_namer_router)
 app.include_router(admin_router)
+app.include_router(qb_checker_router)
+app.include_router(organizer_router)
+app.include_router(bills_report_router)
+
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 @app.get("/routes")
 async def list_routes():
