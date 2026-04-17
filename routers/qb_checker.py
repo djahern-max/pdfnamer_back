@@ -261,3 +261,175 @@ async def compare_bills(
         skipped_receipts=skipped,
         qb_bills_parsed=len(qb_bills),
     )
+
+
+@router.post("/export.xlsx")
+async def export_comparison_excel(
+    file: UploadFile = File(...),
+    tenant: Tenant = Depends(require_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Run the same comparison as /compare and return a styled Excel workbook
+    with two sheets: 'Needs Entry' and 'Already in QuickBooks'.
+    """
+    from datetime import datetime
+    import openpyxl
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+    from fastapi.responses import StreamingResponse
+
+    if not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(
+            400, "Please upload a QuickBooks Excel export (.xlsx or .xls)."
+        )
+
+    file_bytes = await file.read()
+    if len(file_bytes) > 10 * 1024 * 1024:
+        raise HTTPException(400, "File too large (10 MB max).")
+
+    try:
+        qb_bills = _parse_qb_excel(file_bytes)
+    except Exception as e:
+        raise HTTPException(422, f"Could not parse QuickBooks export: {e}")
+
+    if not qb_bills:
+        raise HTTPException(422, "No bills found in the QuickBooks export.")
+
+    vi_keys, va_keys = _build_qb_index(qb_bills)
+
+    result = await db.execute(
+        select(PdfNaming)
+        .where(PdfNaming.tenant_id == tenant.id, PdfNaming.confirmed_name.isnot(None))
+        .order_by(desc(PdfNaming.created_at))
+    )
+    records = result.scalars().all()
+
+    needs_entry: list[BillItem] = []
+    already_entered: list[BillItem] = []
+
+    for r in records:
+        if r.doc_type in _SKIP_DOC_TYPES:
+            continue
+        item = BillItem(
+            confirmed_name=r.confirmed_name or "",
+            vendor=r.vendor,
+            invoice_number=r.invoice_number,
+            amount=r.amount,
+            doc_date=r.doc_date,
+            doc_type=r.doc_type,
+        )
+        if _is_in_qb(r, vi_keys, va_keys):
+            already_entered.append(item)
+        else:
+            needs_entry.append(item)
+
+    # ── Build workbook ────────────────────────────────────────────────────
+    wb = openpyxl.Workbook()
+
+    # Shared styles
+    thin = Side(style="thin", color="D1D5DB")
+    cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    def _write_sheet(
+        ws, bills: list[BillItem], title: str, title_color: str, row_accent: str
+    ):
+        col_widths = [30, 14, 22, 14, 14, 48]
+        headers = ["Vendor", "Bill Date", "Bill No.", "Amount", "Type", "File Name"]
+
+        # Title row
+        ws.merge_cells("A1:F1")
+        tc = ws["A1"]
+        tc.value = f"{title}  —  {len(bills)} bill{'s' if len(bills) != 1 else ''}  ·  Generated {datetime.now().strftime('%m/%d/%Y')}"
+        tc.font = Font(bold=True, color="FFFFFF", size=12)
+        tc.fill = PatternFill("solid", fgColor=title_color)
+        tc.alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[1].height = 26
+
+        # Header row
+        for col, h in enumerate(headers, 1):
+            c = ws.cell(row=2, column=col, value=h)
+            c.font = Font(bold=True, color="FFFFFF", size=10)
+            c.fill = PatternFill("solid", fgColor="1E3A5F")
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            c.border = cell_border
+        ws.row_dimensions[2].height = 20
+
+        # Column widths
+        for i, w in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+        # Data rows
+        def _fmt(raw):
+            if not raw or not re.match(r"^\d{8}$", raw):
+                return raw or ""
+            return f"{raw[0:2]}/{raw[2:4]}/{raw[4:8]}"
+
+        total_amount = 0.0
+        for i, b in enumerate(bills):
+            row = i + 3
+            fill = PatternFill("solid", fgColor=row_accent if i % 2 == 0 else "FFFFFF")
+            amt = 0.0
+            try:
+                amt = float(b.amount or 0)
+            except ValueError:
+                pass
+            total_amount += amt
+
+            values = [
+                b.vendor or "",
+                _fmt(b.doc_date),
+                b.invoice_number or "",
+                amt,
+                b.doc_type or "",
+                (b.confirmed_name or "") + ".pdf",
+            ]
+            for col, val in enumerate(values, 1):
+                c = ws.cell(row=row, column=col, value=val)
+                c.fill = fill
+                c.border = cell_border
+                c.font = Font(size=10)
+                if col == 4:
+                    c.number_format = '"$"#,##0.00'
+                    c.alignment = Alignment(horizontal="right", vertical="center")
+                elif col == 2:
+                    c.alignment = Alignment(horizontal="center", vertical="center")
+
+        # Total row
+        total_row = len(bills) + 3
+        ws.merge_cells(f"A{total_row}:C{total_row}")
+        tc = ws.cell(row=total_row, column=1, value="TOTAL")
+        tc.font = Font(bold=True, size=10)
+        tc.fill = PatternFill("solid", fgColor="E5E7EB")
+        tc.border = cell_border
+        ac = ws.cell(row=total_row, column=4, value=total_amount)
+        ac.number_format = '"$"#,##0.00'
+        ac.font = Font(bold=True, size=10)
+        ac.fill = PatternFill("solid", fgColor="E5E7EB")
+        ac.alignment = Alignment(horizontal="right", vertical="center")
+        ac.border = cell_border
+        for col in [5, 6]:
+            c = ws.cell(row=total_row, column=col)
+            c.fill = PatternFill("solid", fgColor="E5E7EB")
+            c.border = cell_border
+
+    # Sheet 1: Needs Entry (red/amber theme)
+    ws1 = wb.active
+    ws1.title = "Needs Entry"
+    _write_sheet(ws1, needs_entry, "⚠ Needs Entry in QuickBooks", "B45309", "FEF3C7")
+
+    # Sheet 2: Already Entered (green theme)
+    ws2 = wb.create_sheet("Already in QuickBooks")
+    _write_sheet(ws2, already_entered, "✓ Already in QuickBooks", "166534", "DCFCE7")
+
+    # Stream response
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    filename = f"QB_Checker_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
