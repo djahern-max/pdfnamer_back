@@ -266,8 +266,16 @@ async def analyze_pdf(
             messages=[{"role": "user", "content": prompt}],
         )
         raw = response.content[0].text.strip()
-        raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+        input_tokens = response.usage.input_tokens
+        output_tokens = response.usage.output_tokens
+        raw = re.sub(r"^```[a-z]*\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
         fields = json.loads(raw)
+
+        # Fix: guard against model returning a JSON array instead of object
+        if isinstance(fields, list):
+            fields = fields[0] if fields else {}
+
     except json.JSONDecodeError:
         raise HTTPException(500, "AI returned unexpected format.")
     except Exception as e:
@@ -289,6 +297,8 @@ async def analyze_pdf(
             if examples
             else "Default pattern"
         ),
+        input_tokens=input_tokens,  # ← new
+        output_tokens=output_tokens,  # ← new
     )
     db.add(record)
     await db.commit()

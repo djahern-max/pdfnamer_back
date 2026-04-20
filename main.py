@@ -13,6 +13,7 @@ from routers.admin import router as admin_router
 from routers.qb_checker import router as qb_checker_router
 from routers.organizer import router as organizer_router
 from routers.bills_report import router as bills_report_router
+from routers.usage_stats import router as usage_stats_router
 
 app = FastAPI(
     title="PDF Auto-Namer",
@@ -33,6 +34,7 @@ app.include_router(admin_router)
 app.include_router(qb_checker_router)
 app.include_router(organizer_router)
 app.include_router(bills_report_router)
+app.include_router(usage_stats_router)
 
 
 @app.get("/health")
