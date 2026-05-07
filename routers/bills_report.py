@@ -16,8 +16,9 @@ from datetime import datetime
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
+from datetime import datetime, date
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -53,61 +54,52 @@ class BillsReportResponse(BaseModel):
     total_amount: float
 
 
-@router.get("/pending", response_model=BillsReportResponse)
-async def get_pending_bills(
+class BillItem(BaseModel):
+    confirmed_name: str
+    vendor: str | None
+    invoice_number: str | None
+    amount: str | None
+    doc_date: str | None
+    doc_type: str | None
+
+
+def _to_item(r: PdfNaming) -> BillItem:
+    return BillItem(
+        confirmed_name=r.confirmed_name,
+        vendor=r.vendor,
+        invoice_number=r.invoice_number,
+        amount=r.amount,
+        doc_date=_fmt_date(r.doc_date),
+        doc_type=r.doc_type,
+    )
+
+
+@router.get("/pending", response_model=list[BillItem])
+async def pending_bills(
     tenant: Tenant = Depends(require_tenant),
     db: AsyncSession = Depends(get_db),
+    since: date | None = Query(
+        default=None,
+        description="Filter to bills confirmed on or after this date (YYYY-MM-DD)",
+    ),
 ):
-    result = await db.execute(
-        select(PdfNaming).where(
+    stmt = (
+        select(PdfNaming)
+        .where(
             PdfNaming.tenant_id == tenant.id,
             PdfNaming.confirmed_name.isnot(None),
+            ~PdfNaming.doc_type.in_(_SKIP_TYPES),
         )
+        .order_by(PdfNaming.created_at.desc())
     )
-    records = result.scalars().all()
-
-    bills = []
-    total_amount = 0.0
-
-    # Group by vendor+invoice to deduplicate (keep earliest)
-    seen: set[str] = set()
-
-    for r in records:
-        if r.doc_type in _SKIP_TYPES:
-            continue
-
-        # Deduplicate by confirmed_name
-        key = (r.confirmed_name or "").strip()
-        if key in seen:
-            continue
-        seen.add(key)
-
-        amt = 0.0
-        try:
-            amt = float(r.amount or 0)
-        except ValueError:
-            pass
-        total_amount += amt
-
-        bills.append(
-            BillEntry(
-                vendor=r.vendor,
-                bill_date=_fmt_date(r.doc_date),
-                bill_no=r.invoice_number,
-                amount=r.amount,
-                doc_type=r.doc_type,
-                confirmed_name=r.confirmed_name or "",
-            )
+    if since:
+        stmt = stmt.where(
+            PdfNaming.created_at >= datetime.combine(since, datetime.min.time())
         )
 
-    # Sort by vendor then date
-    bills.sort(key=lambda b: (b.vendor or "", b.bill_date or ""))
-
-    return BillsReportResponse(
-        bills=bills,
-        total=len(bills),
-        total_amount=round(total_amount, 2),
-    )
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
+    return [_to_item(r) for r in rows]
 
 
 @router.get("/export.xlsx")
