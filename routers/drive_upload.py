@@ -22,12 +22,9 @@ from models.tenant import Tenant
 
 router = APIRouter(prefix="/api/drive", tags=["Drive Upload"])
 
-# ── Config ────────────────────────────────────────────────────────────────────
-# The folder ID is the long string at the end of your Drive folder URL:
-# https://drive.google.com/drive/u/0/folders/<FOLDER_ID>
 PARENT_FOLDER_ID = os.getenv(
     "DRIVE_VENDOR_FOLDER_ID",
-    "1WJwaq-L4rC9QKdUeQvnS9AWa1bZqgnDt",  # your VENDORS_Scanned_and_in_QB folder
+    "1WJwaq-L4rC9QKdUeQvnS9AWa1bZqgnDt",
 )
 
 _GCP_CREDENTIALS_FILE = os.path.join(
@@ -35,11 +32,7 @@ _GCP_CREDENTIALS_FILE = os.path.join(
     "pdfreader_cloud_vision.json",
 )
 
-# Drive needs a broader scope than Vision; add this to your service account
 SCOPES = ["https://www.googleapis.com/auth/drive"]
-
-
-# ── Drive client (lazy singleton) ─────────────────────────────────────────────
 
 _drive_service = None
 
@@ -54,14 +47,8 @@ def _get_drive():
     return _drive_service
 
 
-# ── Schemas ───────────────────────────────────────────────────────────────────
-
-
 class CreateFolderRequest(BaseModel):
     vendor_name: str
-
-
-# ── Routes ────────────────────────────────────────────────────────────────────
 
 
 @router.get("/vendor-folders")
@@ -79,6 +66,8 @@ async def list_vendor_folders(tenant: Tenant = Depends(require_tenant)):
                 ),
                 fields="files(id, name)",
                 pageSize=500,
+                includeItemsFromAllDrives=True,  # ← required for Shared Drives
+                supportsAllDrives=True,  # ← required for Shared Drives
             )
             .execute()
         )
@@ -99,7 +88,15 @@ async def create_vendor_folder(
             "mimeType": "application/vnd.google-apps.folder",
             "parents": [PARENT_FOLDER_ID],
         }
-        folder = svc.files().create(body=metadata, fields="id, name").execute()
+        folder = (
+            svc.files()
+            .create(
+                body=metadata,
+                fields="id, name",
+                supportsAllDrives=True,  # ← required for Shared Drives
+            )
+            .execute()
+        )
         return {"id": folder["id"], "name": folder["name"]}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -121,7 +118,12 @@ async def upload_file(
         media = MediaIoBaseUpload(io.BytesIO(content), mimetype="application/pdf")
         uploaded = (
             svc.files()
-            .create(body=metadata, media_body=media, fields="id, name, webViewLink")
+            .create(
+                body=metadata,
+                media_body=media,
+                fields="id, name, webViewLink",
+                supportsAllDrives=True,  # ← required for Shared Drives
+            )
             .execute()
         )
         return {

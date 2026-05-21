@@ -1,5 +1,3 @@
-# PDF Auto-Namer (multi-tenant)
-
 """
 routers/pdf_namer.py  –  PDF Auto-Namer (multi-tenant)
 -------------------------------------------------------
@@ -19,17 +17,17 @@ Routes:
 """
 
 import asyncio
-import base64
 import io
 import os
 import re
 import json
 
 import pdfplumber
-from fastapi import APIRouter, File, HTTPException, UploadFile, Depends
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
+
 
 import anthropic
 from google.cloud import vision
@@ -40,6 +38,11 @@ from auth import require_tenant
 from models.tenant import PdfNaming, Tenant
 
 router = APIRouter(prefix="/api/pdf-namer", tags=["PDF Namer"])
+
+PDF_OUTPUT_DIR = os.path.expanduser(
+    os.getenv("PDF_OUTPUT_DIR", "~/Desktop/To_Upload_To_Drive")
+)
+PDF_INPUT_DIR = os.path.expanduser(os.getenv("PDF_INPUT_DIR", "~/Downloads"))
 
 _claude = anthropic.AsyncAnthropic()
 
@@ -79,11 +82,18 @@ class ConfirmRequest(BaseModel):
     session_id: str
     confirmed_name: str
     original_filename: str
+    job_name: str | None = None
 
 
 class ConfirmResponse(BaseModel):
     message: str
     pattern_learned: str
+
+
+class SaveFileResponse(BaseModel):
+    saved_path: str
+    original_deleted: bool
+    message: str
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -110,7 +120,7 @@ def _extract_text_vision(file_bytes: bytes) -> str:
         mime_type="application/pdf",
     )
     output_config = vision.OutputConfig(
-        batch_size=2,  # pages per response
+        batch_size=2,
     )
     feature = vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)
 
@@ -119,7 +129,6 @@ def _extract_text_vision(file_bytes: bytes) -> str:
         features=[feature],
     )
 
-    # Use the synchronous batch method for in-memory PDFs
     response = client.batch_annotate_files(requests=[request])
 
     parts = []
@@ -272,7 +281,6 @@ async def analyze_pdf(
         raw = re.sub(r"\s*```$", "", raw)
         fields = json.loads(raw)
 
-        # Fix: guard against model returning a JSON array instead of object
         if isinstance(fields, list):
             fields = fields[0] if fields else {}
 
@@ -297,8 +305,8 @@ async def analyze_pdf(
             if examples
             else "Default pattern"
         ),
-        input_tokens=input_tokens,  # ← new
-        output_tokens=output_tokens,  # ← new
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
     db.add(record)
     await db.commit()
@@ -338,6 +346,7 @@ async def confirm_naming(
         raise HTTPException(404, "Session not found.")
 
     record.confirmed_name = body.confirmed_name.replace(".pdf", "").strip()
+    record.job_name = body.job_name.strip() if body.job_name else None
     await db.commit()
 
     template = record.confirmed_name
@@ -348,7 +357,6 @@ async def confirm_naming(
     if record.amount:
         template = template.replace(record.amount, "{Amount}")
     if record.payment_method:
-        # payment_method is e.g. "Visa_1762" — tokenize both together and separately
         template = template.replace(f"CC_{record.payment_method}", "CC_{PaymentMethod}")
         template = template.replace(record.payment_method, "{PaymentMethod}")
     if record.invoice_number:
@@ -386,6 +394,7 @@ async def list_patterns(
             "doc_type": r.doc_type,
             "payment_method": r.payment_method,
             "invoice_number": r.invoice_number,
+            "job_name": r.job_name,
             "created_at": r.created_at.isoformat(),
         }
         for r in rows
@@ -410,3 +419,46 @@ async def delete_pattern(
     await db.delete(record)
     await db.commit()
     return {"message": f"Deleted pattern {record_id}."}
+
+
+@router.post("/save-file", response_model=SaveFileResponse)
+async def save_file(
+    file: UploadFile = File(...),
+    confirmed_name: str = Form(...),
+    original_filename: str = Form(...),
+    tenant: Tenant = Depends(require_tenant),
+):
+    os.makedirs(PDF_OUTPUT_DIR, exist_ok=True)
+
+    safe_name = confirmed_name.strip()
+    if not safe_name.lower().endswith(".pdf"):
+        safe_name += ".pdf"
+
+    if "/" in safe_name or "\\" in safe_name or ".." in safe_name:
+        raise HTTPException(400, "Invalid filename.")
+
+    dest_path = os.path.join(PDF_OUTPUT_DIR, safe_name)
+
+    try:
+        contents = await file.read()
+        with open(dest_path, "wb") as f:
+            f.write(contents)
+    except Exception as e:
+        raise HTTPException(500, f"Could not write file: {e}")
+
+    original_deleted = False
+    if original_filename:
+        original_path = os.path.join(PDF_INPUT_DIR, original_filename)
+        if os.path.isfile(original_path):
+            try:
+                os.remove(original_path)
+                original_deleted = True
+            except Exception:
+                pass
+
+    return SaveFileResponse(
+        saved_path=dest_path,
+        original_deleted=original_deleted,
+        message=f'Saved "{safe_name}" to To_Upload_To_Drive'
+        + (" and deleted original." if original_deleted else "."),
+    )

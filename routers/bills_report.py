@@ -11,14 +11,13 @@ Routes:
 
 import io
 import re
-from datetime import datetime
+from datetime import datetime, date
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
-from datetime import datetime, date
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -41,10 +40,11 @@ def _fmt_date(raw: str | None) -> str:
 
 class BillEntry(BaseModel):
     vendor: str | None
-    bill_date: str | None  # formatted MM/DD/YYYY
+    bill_date: str | None
     bill_no: str | None
     amount: str | None
     doc_type: str | None
+    job_name: str | None
     confirmed_name: str
 
 
@@ -61,6 +61,7 @@ class BillItem(BaseModel):
     amount: str | None
     doc_date: str | None
     doc_type: str | None
+    job_name: str | None
 
 
 def _to_item(r: PdfNaming) -> BillItem:
@@ -71,6 +72,7 @@ def _to_item(r: PdfNaming) -> BillItem:
         amount=r.amount,
         doc_date=_fmt_date(r.doc_date),
         doc_type=r.doc_type,
+        job_name=r.job_name,
     )
 
 
@@ -108,81 +110,120 @@ async def export_bills_excel(
     db: AsyncSession = Depends(get_db),
 ):
     """Download all pending bills as a formatted Excel workbook."""
-    data = await get_pending_bills(tenant, db)
+    stmt = (
+        select(PdfNaming)
+        .where(
+            PdfNaming.tenant_id == tenant.id,
+            PdfNaming.confirmed_name.isnot(None),
+            ~PdfNaming.doc_type.in_(_SKIP_TYPES),
+        )
+        .order_by(PdfNaming.created_at.desc())
+    )
+    result = await db.execute(stmt)
+    rows = result.scalars().all()
 
+    bills = [_to_item(r) for r in rows]
+    total_amount = sum(float(b.amount or 0) for b in bills)
+
+    data = BillsReportResponse(
+        bills=[
+            BillEntry(
+                vendor=b.vendor,
+                bill_date=b.doc_date,
+                bill_no=b.invoice_number,
+                amount=b.amount,
+                doc_type=b.doc_type,
+                job_name=b.job_name,
+                confirmed_name=b.confirmed_name,
+            )
+            for b in bills
+        ],
+        total=len(bills),
+        total_amount=total_amount,
+    )
+
+    wb = _build_workbook(data)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=bills_to_enter.xlsx"},
+    )
+
+
+# ─── Excel builder ────────────────────────────────────────────────────────────
+
+
+def _build_workbook(data: BillsReportResponse) -> openpyxl.Workbook:
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "Bills to Enter"
 
     # ── Styles ────────────────────────────────────────────────────────────
-    blue = "2563EB"
-    light_blue = "DBEAFE"
-    header_bg = "1E3A5F"
-    row_alt = "F0F4FF"
-    green = "16A34A"
-    border_col = "D1D5DB"
+    accent = "2563EB"
+    accent_light = "DBEAFE"
+    vendor_bg = "EFF6FF"
+    row_alt = "F9FAFB"
+    header_font = Font(bold=True, color="FFFFFF", size=10)
+    vendor_font = Font(bold=True, color=accent, size=10)
+    total_font = Font(bold=True, size=10)
 
-    thin = Side(style="thin", color=border_col)
+    thin = Side(style="thin", color="E5E7EB")
     cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-    def hdr_style(cell):
-        cell.font = Font(bold=True, color="FFFFFF", size=10)
-        cell.fill = PatternFill("solid", fgColor=header_bg)
-        cell.alignment = Alignment(
-            horizontal="center", vertical="center", wrap_text=True
+    def hdr_style(c):
+        c.font = header_font
+        c.fill = PatternFill("solid", fgColor=accent)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        c.border = cell_border
+
+    def vendor_style(c):
+        c.font = vendor_font
+        c.fill = PatternFill("solid", fgColor=vendor_bg)
+        c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        c.border = Border(
+            left=Side(style="medium", color=accent_light),
+            right=Side(style="medium", color=accent_light),
+            top=Side(style="medium", color=accent_light),
+            bottom=Side(style="thin", color=accent_light),
         )
-        cell.border = cell_border
-
-    def title_style(cell):
-        cell.font = Font(bold=True, color="FFFFFF", size=13)
-        cell.fill = PatternFill("solid", fgColor=blue)
-        cell.alignment = Alignment(horizontal="left", vertical="center")
-
-    def vendor_style(cell):
-        cell.font = Font(bold=True, color=blue, size=10)
-        cell.fill = PatternFill("solid", fgColor=light_blue)
-        cell.alignment = Alignment(horizontal="left", vertical="center")
-        cell.border = cell_border
-
-    def total_style(cell, is_amount=False):
-        cell.font = Font(bold=True, size=10, color="111827")
-        cell.fill = PatternFill("solid", fgColor="E5E7EB")
-        cell.alignment = Alignment(
-            horizontal="right" if is_amount else "left", vertical="center"
-        )
-        cell.border = cell_border
 
     # ── Title row ─────────────────────────────────────────────────────────
-    ws.merge_cells("A1:F1")
-    title_cell = ws["A1"]
-    title_cell.value = (
-        f"Bills to Enter — Generated {datetime.now().strftime('%m/%d/%Y %I:%M %p')}"
+    ws.merge_cells("A1:G1")
+    title_cell = ws.cell(
+        row=1, column=1, value="Bills to Enter — Rye Beach Landscaping"
     )
-    title_style(title_cell)
+    title_cell.font = Font(bold=True, size=13, color="111827")
+    title_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
     ws.row_dimensions[1].height = 28
 
-    # ── Sub-title row ─────────────────────────────────────────────────────
-    ws.merge_cells("A2:F2")
-    sub = ws["A2"]
-    sub.value = f"{data.total} bills  ·  Total: ${data.total_amount:,.2f}"
-    sub.font = Font(italic=True, color="6B7280", size=9)
-    sub.alignment = Alignment(horizontal="left", vertical="center")
+    ws.merge_cells("A2:G2")
+    sub_cell = ws.cell(
+        row=2,
+        column=1,
+        value=f"Generated {datetime.now().strftime('%B %d, %Y')}  ·  {data.total} bills  ·  Total: ${data.total_amount:,.2f}",
+    )
+    sub_cell.font = Font(size=9, color="6B7280")
+    sub_cell.alignment = Alignment(horizontal="left", vertical="center", indent=1)
     ws.row_dimensions[2].height = 16
 
     # ── Column headers ────────────────────────────────────────────────────
-    headers = ["Vendor", "Bill Date", "Bill No.", "Amount", "Type", "File Name"]
+    headers = ["Vendor", "Bill Date", "Bill No.", "Amount", "Type", "Job", "File Name"]
     ws.row_dimensions[3].height = 22
     for col, h in enumerate(headers, 1):
         c = ws.cell(row=3, column=col, value=h)
         hdr_style(c)
 
     # ── Column widths ─────────────────────────────────────────────────────
-    col_widths = [32, 14, 20, 14, 14, 46]
+    col_widths = [28, 13, 20, 13, 13, 22, 46]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
     # ── Data rows grouped by vendor ───────────────────────────────────────
-    # Build vendor groups
     groups: dict[str, list] = {}
     for b in data.bills:
         v = b.vendor or "Unknown"
@@ -194,7 +235,7 @@ async def export_bills_excel(
         v_total = sum(float(b.amount or 0) for b in bills)
 
         # Vendor header row
-        ws.merge_cells(f"A{row}:F{row}")
+        ws.merge_cells(f"A{row}:G{row}")
         vc = ws.cell(
             row=row,
             column=1,
@@ -215,6 +256,7 @@ async def export_bills_excel(
                 b.bill_no or "",
                 amt,
                 b.doc_type or "",
+                b.job_name or "",
                 b.confirmed_name + ".pdf",
             ]
             for col, val in enumerate(values, 1):
@@ -223,49 +265,43 @@ async def export_bills_excel(
                 c.border = cell_border
                 c.font = Font(size=10)
 
-                if col == 4:  # Amount column
+                if col == 4:  # Amount
                     c.number_format = '"$"#,##0.00'
                     c.alignment = Alignment(horizontal="right", vertical="center")
-                elif col == 2:  # Date column
+                elif col == 2:  # Date
                     c.alignment = Alignment(horizontal="center", vertical="center")
                 elif col == 3:  # Bill No.
-                    c.font = Font(size=10, bold=True)
-                    c.alignment = Alignment(horizontal="left", vertical="center")
+                    c.alignment = Alignment(horizontal="center", vertical="center")
                 else:
-                    c.alignment = Alignment(horizontal="left", vertical="center")
+                    c.alignment = Alignment(
+                        horizontal="left", vertical="center", indent=1
+                    )
 
             ws.row_dimensions[row].height = 16
             row += 1
 
-    # ── Grand total row ───────────────────────────────────────────────────
+    # ── Grand total ───────────────────────────────────────────────────────
     ws.merge_cells(f"A{row}:C{row}")
-    lbl = ws.cell(row=row, column=1, value=f"TOTAL  ({data.total} bills)")
-    total_style(lbl)
-    ws.cell(row=row, column=2).border = cell_border
-    ws.cell(row=row, column=3).border = cell_border
+    lc = ws.cell(row=row, column=1, value=f"  TOTAL  ·  {data.total} bills")
+    lc.font = total_font
+    lc.fill = PatternFill("solid", fgColor="F3F4F6")
+    lc.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+    lc.border = cell_border
 
-    amt_cell = ws.cell(row=row, column=4, value=data.total_amount)
-    total_style(amt_cell, is_amount=True)
-    amt_cell.number_format = '"$"#,##0.00'
-    amt_cell.font = Font(bold=True, size=11, color=green)
+    tc = ws.cell(row=row, column=4, value=data.total_amount)
+    tc.font = Font(bold=True, size=11)
+    tc.number_format = '"$"#,##0.00'
+    tc.alignment = Alignment(horizontal="right", vertical="center")
+    tc.fill = PatternFill("solid", fgColor="F3F4F6")
+    tc.border = cell_border
 
-    for col in [5, 6]:
+    for col in [5, 6, 7]:
         c = ws.cell(row=row, column=col)
-        total_style(c)
+        c.fill = PatternFill("solid", fgColor="F3F4F6")
+        c.border = cell_border
 
     ws.row_dimensions[row].height = 20
 
-    # ── Freeze panes below headers ────────────────────────────────────────
     ws.freeze_panes = "A4"
 
-    # ── Stream response ───────────────────────────────────────────────────
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-
-    filename = f"bills_to_enter_{datetime.now().strftime('%Y%m%d')}.xlsx"
-    return StreamingResponse(
-        buf,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={filename}"},
-    )
+    return wb

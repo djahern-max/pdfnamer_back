@@ -79,13 +79,13 @@ class ApiKey(Base):
 
 # Valid doc_type values — enforced in the prompt, stored as plain strings for flexibility.
 #
-#   invoice      Traditional A/P invoice with a due date
-#   statement    Periodic account summary
-#   cc_receipt   Paid at point of sale via credit/debit card
+#   invoice        Traditional A/P invoice with a due date
+#   statement      Periodic account summary
+#   cc_receipt     Paid at point of sale via credit/debit card
 #   check_receipt  Paid at POS via check or cash
-#   contract     Agreement / rental contract
-#   estimate     Quote or proposal
-#   other        Anything that doesn't fit the above
+#   contract       Agreement / rental contract
+#   estimate       Quote or proposal
+#   other          Anything that doesn't fit the above
 
 
 class PdfNaming(Base):
@@ -116,8 +116,8 @@ class PdfNaming(Base):
     # e.g. "INV-1042", "2026-0391" — extracted from invoice/statement headers
     invoice_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    confidence: Mapped[str | None] = mapped_column(String(16), nullable=True)
-    pattern_used: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # e.g. "Smith Residence", "Town Hall Walkway" — user-assigned job/project
+    job_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     confidence: Mapped[str | None] = mapped_column(String(16), nullable=True)
     pattern_used: Mapped[str | None] = mapped_column(String(512), nullable=True)
