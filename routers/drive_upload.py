@@ -24,7 +24,7 @@ router = APIRouter(prefix="/api/drive", tags=["Drive Upload"])
 
 PARENT_FOLDER_ID = os.getenv(
     "DRIVE_VENDOR_FOLDER_ID",
-    "1WJwaq-L4rC9QKdUeQvnS9AWa1bZqgnDt",
+    "1OdMFNliKHFeeRfnwiSqFv5MaUQM7CRH_",
 )
 
 _GCP_CREDENTIALS_FILE = os.path.join(
