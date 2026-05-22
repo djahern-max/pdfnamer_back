@@ -4,7 +4,7 @@ routers/drive_upload.py – Google Drive bulk upload to vendor subfolders
 Routes:
   GET  /api/drive/vendor-folders          List existing vendor subfolders
   POST /api/drive/create-vendor-folder    Create a new vendor subfolder
-  POST /api/drive/upload-file             Upload a single PDF to a folder
+  POST /api/drive/upload-file             Upload a single PDF (auto-creates vendor folder)
 """
 
 import io
@@ -47,6 +47,46 @@ def _get_drive():
     return _drive_service
 
 
+def _get_or_create_vendor_folder(svc, vendor_name: str) -> str:
+    """Return the Drive folder ID for vendor_name, creating it if needed."""
+    # Search for existing folder
+    results = (
+        svc.files()
+        .list(
+            q=(
+                f"'{PARENT_FOLDER_ID}' in parents"
+                f" and name = '{vendor_name}'"
+                " and mimeType='application/vnd.google-apps.folder'"
+                " and trashed=false"
+            ),
+            fields="files(id, name)",
+            includeItemsFromAllDrives=True,
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    folders = results.get("files", [])
+    if folders:
+        return folders[0]["id"]
+
+    # Create it
+    metadata = {
+        "name": vendor_name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [PARENT_FOLDER_ID],
+    }
+    folder = (
+        svc.files()
+        .create(
+            body=metadata,
+            fields="id",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return folder["id"]
+
+
 class CreateFolderRequest(BaseModel):
     vendor_name: str
 
@@ -66,8 +106,8 @@ async def list_vendor_folders(tenant: Tenant = Depends(require_tenant)):
                 ),
                 fields="files(id, name)",
                 pageSize=500,
-                includeItemsFromAllDrives=True,  # ← required for Shared Drives
-                supportsAllDrives=True,  # ← required for Shared Drives
+                includeItemsFromAllDrives=True,
+                supportsAllDrives=True,
             )
             .execute()
         )
@@ -93,7 +133,7 @@ async def create_vendor_folder(
             .create(
                 body=metadata,
                 fields="id, name",
-                supportsAllDrives=True,  # ← required for Shared Drives
+                supportsAllDrives=True,
             )
             .execute()
         )
@@ -105,14 +145,15 @@ async def create_vendor_folder(
 @router.post("/upload-file")
 async def upload_file(
     file: UploadFile = File(...),
-    folder_id: str = Form(...),
+    vendor_name: str = Form(...),
     tenant: Tenant = Depends(require_tenant),
 ):
-    """Upload a PDF into the given Drive folder (by folder_id)."""
+    """Upload a PDF into the vendor's Drive folder, creating it if it doesn't exist."""
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
     try:
         svc = _get_drive()
+        folder_id = _get_or_create_vendor_folder(svc, vendor_name)
         content = await file.read()
         metadata = {"name": file.filename, "parents": [folder_id]}
         media = MediaIoBaseUpload(io.BytesIO(content), mimetype="application/pdf")
@@ -122,7 +163,7 @@ async def upload_file(
                 body=metadata,
                 media_body=media,
                 fields="id, name, webViewLink",
-                supportsAllDrives=True,  # ← required for Shared Drives
+                supportsAllDrives=True,
             )
             .execute()
         )

@@ -448,13 +448,22 @@ async def save_file(
 
     original_deleted = False
     if original_filename:
-        original_path = os.path.join(PDF_INPUT_DIR, original_filename)
-        if os.path.isfile(original_path):
-            try:
-                os.remove(original_path)
-                original_deleted = True
-            except Exception:
-                pass
+        # Check multiple possible source locations
+        search_dirs = [
+            PDF_INPUT_DIR,
+            os.path.expanduser("~/Desktop/To_Upload/Vendor_Invoices"),
+            os.path.expanduser("~/Desktop"),
+            os.path.expanduser("~/Downloads"),
+        ]
+        for search_dir in search_dirs:
+            original_path = os.path.join(search_dir, original_filename)
+            if os.path.isfile(original_path):
+                try:
+                    os.remove(original_path)
+                    original_deleted = True
+                except Exception:
+                    pass
+                break
 
     return SaveFileResponse(
         saved_path=dest_path,
