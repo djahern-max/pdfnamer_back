@@ -14,6 +14,8 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy import select, desc
+from models.tenant import PdfNaming
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -204,3 +206,59 @@ async def upload_file(
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+class ResolveRequest(BaseModel):
+    filenames: list[str]
+
+
+class ResolvedFile(BaseModel):
+    filename: str
+    vendor: str | None  # None = not found in DB, frontend falls back to parsing
+
+
+@router.post("/resolve-vendors", response_model=list[ResolvedFile])
+async def resolve_vendors(
+    body: ResolveRequest,
+    tenant: Tenant = Depends(require_tenant),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Look up each filename in pdf_namings by confirmed_name (stem match).
+    Returns the stored vendor field with alias resolution applied.
+    Falls back to None if not found — frontend should warn the user.
+    """
+    alias_result = await db.execute(
+        select(VendorAlias).where(VendorAlias.tenant_id == tenant.id)
+    )
+    aliases = {
+        r.invoice_name.lower(): r.canonical_name for r in alias_result.scalars().all()
+    }
+
+    results = []
+    for filename in body.filenames:
+        stem = filename.replace(".pdf", "").replace(".PDF", "").strip()
+
+        # Try exact confirmed_name match first, then normalized (spaces↔underscores)
+        row = None
+        for candidate in [stem, stem.replace(" ", "_"), stem.replace("_", " ")]:
+            result = await db.execute(
+                select(PdfNaming)
+                .where(
+                    PdfNaming.tenant_id == tenant.id,
+                    PdfNaming.confirmed_name == candidate,
+                )
+                .order_by(desc(PdfNaming.created_at))
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+            if row:
+                break
+
+        vendor = None
+        if row and row.vendor:
+            vendor = aliases.get(row.vendor.strip().lower(), row.vendor)
+
+        results.append(ResolvedFile(filename=filename, vendor=vendor))
+
+    return results
