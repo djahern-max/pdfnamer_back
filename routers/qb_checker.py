@@ -7,17 +7,16 @@ to be manually entered in QuickBooks.
 
 Rules:
   - cc_receipt and check_receipt doc types are SKIPPED entirely
-    (credit cards auto-import; cash/check receipts don't need entry)
-  - All other confirmed doc types (invoice, statement, contract,
-    estimate, other) are checked against the QB export
+  - All other confirmed doc types are checked against the QB export
 
 Matching strategy:
-  1. Primary:  normalize(vendor) + normalize(invoice_number)
-  2. Fallback: normalize(vendor) + normalize(amount)
-     (for bills with no invoice number on either side)
+  1. Alias lookup  →  resolve invoice vendor name to canonical QB name
+  2. Primary:      normalize(vendor) + normalize(invoice_number)
+  3. Fallback:     normalize(vendor) + normalize(amount)
 
 Routes:
-  POST /api/qb-checker/compare   Upload QB Excel → get needs_entry / already_entered
+  POST /api/qb-checker/compare      Upload QB Excel → get needs_entry / already_entered
+  POST /api/qb-checker/export.xlsx  Same comparison as downloadable Excel workbook
 """
 
 import io
@@ -31,11 +30,10 @@ from sqlalchemy import select, desc
 
 from database import get_db
 from auth import require_tenant
-from models.tenant import PdfNaming, Tenant
+from models.tenant import PdfNaming, Tenant, VendorAlias
 
 router = APIRouter(prefix="/api/qb-checker", tags=["QB Checker"])
 
-# Doc types that never need QB entry
 _SKIP_DOC_TYPES = {"cc_receipt", "check_receipt"}
 
 
@@ -58,6 +56,24 @@ class CompareResponse(BaseModel):
     qb_bills_parsed: int
 
 
+# ─── Alias loader ─────────────────────────────────────────────────────────────
+
+
+async def _load_aliases(db: AsyncSession, tenant_id: int) -> dict[str, str]:
+    """Returns {invoice_name_lower: canonical_name} for this tenant."""
+    result = await db.execute(
+        select(VendorAlias).where(VendorAlias.tenant_id == tenant_id)
+    )
+    return {r.invoice_name.lower(): r.canonical_name for r in result.scalars().all()}
+
+
+def _resolve_vendor(raw: str | None, aliases: dict[str, str]) -> str | None:
+    """Apply alias table first; fall back to raw name if no alias found."""
+    if not raw:
+        return None
+    return aliases.get(raw.strip().lower(), raw)
+
+
 # ─── QB Excel Parser ──────────────────────────────────────────────────────────
 
 
@@ -66,9 +82,7 @@ def _normalize(value: str | None) -> str:
     if not value:
         return ""
     s = str(value).lower().strip()
-    # Strip leading "INV", "INV-", "#", "inv " etc.
     s = re.sub(r"^(inv[-#\s]?|#\s*)", "", s)
-    # Strip leading zeros
     s = s.lstrip("0") or "0"
     return s
 
@@ -78,7 +92,6 @@ def _normalize_vendor(value: str | None) -> str:
     if not value:
         return ""
     s = str(value).lower().strip()
-    # Remove common suffixes that vary between QB and PDF
     s = re.sub(r"\b(llc|inc|corp|co|ltd|pllc|ent|company|supply)\b\.?", "", s)
     s = re.sub(r"[^\w\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
@@ -103,27 +116,21 @@ def _parse_qb_excel(file_bytes: bytes) -> list[dict]:
 
     for _, row in df.iterrows():
         col0 = str(row.iloc[0]).strip() if pd.notna(row.iloc[0]) else ""
-        col1 = row.iloc[1] if pd.notna(row.iloc[1]) else None  # Date
-        col2 = (
-            str(row.iloc[2]).strip() if pd.notna(row.iloc[2]) else ""
-        )  # Transaction type
-        col3 = (
-            str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else ""
-        )  # Num / invoice #
-        col6 = row.iloc[6] if pd.notna(row.iloc[6]) else None  # Amount
+        col1 = row.iloc[1] if pd.notna(row.iloc[1]) else None
+        col2 = str(row.iloc[2]).strip() if pd.notna(row.iloc[2]) else ""
+        col3 = str(row.iloc[3]).strip() if pd.notna(row.iloc[3]) else ""
+        col6 = row.iloc[6] if pd.notna(row.iloc[6]) else None
 
         # Vendor header row
         if col0 and not col0.startswith("Total for") and not col1 and col2 == "":
-            # Skip report-level headers
             if col0 not in ("Unpaid Bills Report", "All Dates") and not col0.startswith(
                 "Sunday"
             ):
                 current_vendor = col0
             continue
 
-        # Detail row (col0 empty, has a transaction type)
+        # Detail row
         if not col0 and col2 in ("Bill", "Vendor Credit", "Expense") and current_vendor:
-            # Only care about Bills for entry purposes
             if col2 == "Bill":
                 amount_str = ""
                 if col6 is not None:
@@ -133,7 +140,6 @@ def _parse_qb_excel(file_bytes: bytes) -> list[dict]:
                         pass
 
                 invoice_num = col3 if col3 not in ("", "nan") else None
-
                 bills.append(
                     {
                         "vendor": current_vendor,
@@ -170,25 +176,27 @@ def _build_qb_index(qb_bills: list[dict]) -> tuple[set[str], set[str]]:
     return vi_keys, va_keys
 
 
-def _is_in_qb(record: PdfNaming, vi_keys: set[str], va_keys: set[str]) -> bool:
-    nv = _normalize_vendor(record.vendor)
+def _is_in_qb(
+    record: PdfNaming,
+    vi_keys: set[str],
+    va_keys: set[str],
+    aliases: dict[str, str],
+) -> bool:
+    resolved = _resolve_vendor(record.vendor, aliases)
+    nv = _normalize_vendor(resolved)
     ni = _normalize(record.invoice_number)
     na = _normalize(record.amount)
 
-    # Primary match: vendor + invoice number
     if nv and ni:
         if f"{nv}::{ni}" in vi_keys:
             return True
-
-    # Fallback match: vendor + amount
     if nv and na:
         if f"{nv}::{na}" in va_keys:
             return True
-
     return False
 
 
-# ─── Route ────────────────────────────────────────────────────────────────────
+# ─── Routes ───────────────────────────────────────────────────────────────────
 
 
 @router.post("/compare", response_model=CompareResponse)
@@ -206,7 +214,6 @@ async def compare_bills(
     if len(file_bytes) > 10 * 1024 * 1024:
         raise HTTPException(400, "File too large (10 MB max).")
 
-    # ── Parse the QB export ───────────────────────────────────────────────
     try:
         qb_bills = _parse_qb_excel(file_bytes)
     except Exception as e:
@@ -219,8 +226,8 @@ async def compare_bills(
         )
 
     vi_keys, va_keys = _build_qb_index(qb_bills)
+    aliases = await _load_aliases(db, tenant.id)
 
-    # ── Fetch confirmed PDF namings for this tenant ───────────────────────
     result = await db.execute(
         select(PdfNaming)
         .where(
@@ -231,7 +238,6 @@ async def compare_bills(
     )
     records = result.scalars().all()
 
-    # ── Classify each record ──────────────────────────────────────────────
     needs_entry: list[BillItem] = []
     already_entered: list[BillItem] = []
     skipped = 0
@@ -250,7 +256,7 @@ async def compare_bills(
             doc_type=r.doc_type,
         )
 
-        if _is_in_qb(r, vi_keys, va_keys):
+        if _is_in_qb(r, vi_keys, va_keys, aliases):
             already_entered.append(item)
         else:
             needs_entry.append(item)
@@ -297,6 +303,7 @@ async def export_comparison_excel(
         raise HTTPException(422, "No bills found in the QuickBooks export.")
 
     vi_keys, va_keys = _build_qb_index(qb_bills)
+    aliases = await _load_aliases(db, tenant.id)
 
     result = await db.execute(
         select(PdfNaming)
@@ -319,7 +326,7 @@ async def export_comparison_excel(
             doc_date=r.doc_date,
             doc_type=r.doc_type,
         )
-        if _is_in_qb(r, vi_keys, va_keys):
+        if _is_in_qb(r, vi_keys, va_keys, aliases):
             already_entered.append(item)
         else:
             needs_entry.append(item)
@@ -327,7 +334,6 @@ async def export_comparison_excel(
     # ── Build workbook ────────────────────────────────────────────────────
     wb = openpyxl.Workbook()
 
-    # Shared styles
     thin = Side(style="thin", color="D1D5DB")
     cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
@@ -337,7 +343,6 @@ async def export_comparison_excel(
         col_widths = [30, 14, 22, 14, 14, 48]
         headers = ["Vendor", "Bill Date", "Bill No.", "Amount", "Type", "File Name"]
 
-        # Title row
         ws.merge_cells("A1:F1")
         tc = ws["A1"]
         tc.value = f"{title}  —  {len(bills)} bill{'s' if len(bills) != 1 else ''}  ·  Generated {datetime.now().strftime('%m/%d/%Y')}"
@@ -346,7 +351,6 @@ async def export_comparison_excel(
         tc.alignment = Alignment(horizontal="left", vertical="center")
         ws.row_dimensions[1].height = 26
 
-        # Header row
         for col, h in enumerate(headers, 1):
             c = ws.cell(row=2, column=col, value=h)
             c.font = Font(bold=True, color="FFFFFF", size=10)
@@ -355,11 +359,9 @@ async def export_comparison_excel(
             c.border = cell_border
         ws.row_dimensions[2].height = 20
 
-        # Column widths
         for i, w in enumerate(col_widths, 1):
             ws.column_dimensions[get_column_letter(i)].width = w
 
-        # Data rows
         def _fmt(raw):
             if not raw or not re.match(r"^\d{8}$", raw):
                 return raw or ""
@@ -395,7 +397,6 @@ async def export_comparison_excel(
                 elif col == 2:
                     c.alignment = Alignment(horizontal="center", vertical="center")
 
-        # Total row
         total_row = len(bills) + 3
         ws.merge_cells(f"A{total_row}:C{total_row}")
         tc = ws.cell(row=total_row, column=1, value="TOTAL")
@@ -413,16 +414,13 @@ async def export_comparison_excel(
             c.fill = PatternFill("solid", fgColor="E5E7EB")
             c.border = cell_border
 
-    # Sheet 1: Needs Entry (red/amber theme)
     ws1 = wb.active
     ws1.title = "Needs Entry"
     _write_sheet(ws1, needs_entry, "⚠ Needs Entry in QuickBooks", "B45309", "FEF3C7")
 
-    # Sheet 2: Already Entered (green theme)
     ws2 = wb.create_sheet("Already in QuickBooks")
     _write_sheet(ws2, already_entered, "✓ Already in QuickBooks", "166534", "DCFCE7")
 
-    # Stream response
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)

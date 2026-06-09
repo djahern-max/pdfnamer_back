@@ -33,6 +33,10 @@ class Tenant(Base):
         back_populates="tenant", cascade="all, delete-orphan"
     )
 
+    vendor_aliases: Mapped[list["VendorAlias"]] = relationship(
+        back_populates="tenant", cascade="all, delete-orphan"
+    )
+
 
 # ─── ApiKey ───────────────────────────────────────────────────────────────────
 
@@ -119,6 +123,10 @@ class PdfNaming(Base):
     # e.g. "Smith Residence", "Town Hall Walkway" — user-assigned job/project
     job_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
+    entered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     confidence: Mapped[str | None] = mapped_column(String(16), nullable=True)
     pattern_used: Mapped[str | None] = mapped_column(String(512), nullable=True)
 
@@ -140,3 +148,25 @@ class PdfNaming(Base):
 # ─── Indexes ──────────────────────────────────────────────────────────────────
 Index("ix_api_keys_key_hash", ApiKey.key_hash)
 Index("ix_pdf_namings_tenant", PdfNaming.tenant_id, PdfNaming.created_at)
+
+
+class VendorAlias(Base):
+    """
+    Maps an invoice vendor name variant → canonical QB vendor name.
+    e.g. "Eliminator Systems Inc." → "Eliminator Systems Inc"
+         "ConvenientMD" → "Convenient MD LLC"
+    """
+
+    __tablename__ = "vendor_aliases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    invoice_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    canonical_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    tenant: Mapped["Tenant"] = relationship(back_populates="vendor_aliases")

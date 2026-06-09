@@ -12,13 +12,16 @@ import os
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 
 from auth import require_tenant
-from models.tenant import Tenant
+from database import get_db
+from models.tenant import Tenant, VendorAlias
 
 router = APIRouter(prefix="/api/drive", tags=["Drive Upload"])
 
@@ -47,9 +50,27 @@ def _get_drive():
     return _drive_service
 
 
+async def _resolve_vendor_name(
+    vendor_name: str, tenant_id: int, db: AsyncSession
+) -> str:
+    """
+    Look up vendor_name in the alias table.
+    Returns canonical_name if an alias exists, otherwise returns vendor_name unchanged.
+    e.g. "Eliminator Systems Inc." → "Eliminator Systems Inc"
+         "ConvenientMD"           → "Convenient MD LLC"
+    """
+    result = await db.execute(
+        select(VendorAlias).where(
+            VendorAlias.tenant_id == tenant_id,
+            VendorAlias.invoice_name == vendor_name.strip().lower(),
+        )
+    )
+    row = result.scalar_one_or_none()
+    return row.canonical_name if row else vendor_name
+
+
 def _get_or_create_vendor_folder(svc, vendor_name: str) -> str:
     """Return the Drive folder ID for vendor_name, creating it if needed."""
-    # Search for existing folder
     results = (
         svc.files()
         .list(
@@ -69,7 +90,6 @@ def _get_or_create_vendor_folder(svc, vendor_name: str) -> str:
     if folders:
         return folders[0]["id"]
 
-    # Create it
     metadata = {
         "name": vendor_name,
         "mimeType": "application/vnd.google-apps.folder",
@@ -147,13 +167,22 @@ async def upload_file(
     file: UploadFile = File(...),
     vendor_name: str = Form(...),
     tenant: Tenant = Depends(require_tenant),
+    db: AsyncSession = Depends(get_db),
 ):
-    """Upload a PDF into the vendor's Drive folder, creating it if it doesn't exist."""
+    """Upload a PDF into the vendor's Drive folder, creating it if it doesn't exist.
+    Resolves vendor_name through the alias table before folder lookup so that
+    name variants (e.g. 'Eliminator Systems Inc.' vs 'Eliminator Systems Inc')
+    always land in the same folder.
+    """
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
     try:
         svc = _get_drive()
-        folder_id = _get_or_create_vendor_folder(svc, vendor_name)
+
+        # Resolve alias before folder lookup — this is the duplicate-folder fix
+        resolved_vendor = await _resolve_vendor_name(vendor_name, tenant.id, db)
+
+        folder_id = _get_or_create_vendor_folder(svc, resolved_vendor)
         content = await file.read()
         metadata = {"name": file.filename, "parents": [folder_id]}
         media = MediaIoBaseUpload(io.BytesIO(content), mimetype="application/pdf")
@@ -171,6 +200,7 @@ async def upload_file(
             "id": uploaded["id"],
             "name": uploaded["name"],
             "link": uploaded.get("webViewLink", ""),
+            "vendor_folder": resolved_vendor,  # useful for the frontend to confirm which folder was used
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
