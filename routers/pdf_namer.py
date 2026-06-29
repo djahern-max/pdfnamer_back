@@ -35,7 +35,7 @@ from google.oauth2 import service_account
 
 from database import get_db
 from auth import require_tenant
-from models.tenant import PdfNaming, Tenant
+from models.tenant import PdfNaming, Tenant, Job
 
 router = APIRouter(prefix="/api/pdf-namer", tags=["PDF Namer"])
 
@@ -83,6 +83,8 @@ class ConfirmRequest(BaseModel):
     confirmed_name: str
     original_filename: str
     job_name: str | None = None
+    is_job_cost: bool | None = None
+    job_id: int | None = None
 
 
 class ConfirmResponse(BaseModel):
@@ -346,7 +348,20 @@ async def confirm_naming(
         raise HTTPException(404, "Session not found.")
 
     record.confirmed_name = body.confirmed_name.replace(".pdf", "").strip()
-    record.job_name = body.job_name.strip() if body.job_name else None
+    record.is_job_cost = body.is_job_cost
+    if body.is_job_cost and body.job_id is not None:
+        job_result = await db.execute(
+            select(Job).where(Job.id == body.job_id, Job.tenant_id == tenant.id)
+        )
+        job = job_result.scalar_one_or_none()
+        if not job:
+            raise HTTPException(404, "Job not found.")
+        record.job_id = job.id
+        record.job_name = job.name  # snapshot for Excel export + legacy reports
+    else:
+        record.job_id = None
+        record.job_name = body.job_name.strip() if body.job_name else None
+
     await db.commit()
 
     template = record.confirmed_name

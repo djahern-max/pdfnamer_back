@@ -2,7 +2,16 @@ from datetime import datetime
 import hashlib
 import secrets
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Boolean, func
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -32,8 +41,10 @@ class Tenant(Base):
     pdf_namings: Mapped[list["PdfNaming"]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan"
     )
-
     vendor_aliases: Mapped[list["VendorAlias"]] = relationship(
+        back_populates="tenant", cascade="all, delete-orphan"
+    )
+    jobs: Mapped[list["Job"]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan"
     )
 
@@ -120,8 +131,20 @@ class PdfNaming(Base):
     # e.g. "INV-1042", "2026-0391" — extracted from invoice/statement headers
     invoice_number: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    # e.g. "Smith Residence", "Town Hall Walkway" — user-assigned job/project
+    # Free-text snapshot of the job name (kept for Excel export + legacy rows).
+    # New rows: copied from the linked Job.name when is_job_cost is True.
     job_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+    # Cost classification:
+    #   True  = job cost (job_id should be set)
+    #   False = overhead
+    #   None  = unclassified (legacy rows from before this feature)
+    is_job_cost: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
+    # Structured link to the jobs table — preferred over the free-text job_name.
+    job_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True
+    )
 
     entered_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -143,11 +166,13 @@ class PdfNaming(Base):
     )
 
     tenant: Mapped["Tenant"] = relationship(back_populates="pdf_namings")
+    job: Mapped["Job | None"] = relationship(back_populates="pdf_namings")
 
 
 # ─── Indexes ──────────────────────────────────────────────────────────────────
 Index("ix_api_keys_key_hash", ApiKey.key_hash)
 Index("ix_pdf_namings_tenant", PdfNaming.tenant_id, PdfNaming.created_at)
+Index("ix_pdf_namings_job", PdfNaming.job_id)
 
 
 class VendorAlias(Base):
@@ -170,3 +195,39 @@ class VendorAlias(Base):
     )
 
     tenant: Mapped["Tenant"] = relationship(back_populates="vendor_aliases")
+
+
+# ─── Job ──────────────────────────────────────────────────────────────────────
+
+
+class Job(Base):
+    """
+    Per-tenant job / project (e.g. "MYERS", "Smith Residence").
+    Invoices flagged as job costs link here via PdfNaming.job_id;
+    non-job costs are classified as Overhead (is_job_cost = False).
+    """
+
+    __tablename__ = "jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    customer: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="true"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    tenant: Mapped["Tenant"] = relationship(back_populates="jobs")
+    pdf_namings: Mapped[list["PdfNaming"]] = relationship(back_populates="job")
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", name="uq_jobs_tenant_name"),
+    )
+
+
+Index("ix_jobs_tenant", Job.tenant_id)
